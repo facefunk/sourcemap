@@ -4,27 +4,172 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"path"
 	"sort"
 	"strings"
 )
 
 type Map struct {
-	Version         int      `json:"version"`
-	File            string   `json:"file,omitempty"`
-	SourceRoot      string   `json:"sourceRoot,omitempty"`
-	Sources         []string `json:"sources,omitempty"`
-	Names           []string `json:"names,omitempty"`
-	Mappings        string   `json:"mappings"`
+	Version         int             `json:"version"`
+	File            string          `json:"file,omitempty"`
+	SourceRoot      string          `json:"sourceRoot,omitempty"`
+	Sources         []string        `json:"sources,omitempty"`
+	SourcesContent  []SourceContent `json:"sourcesContent,omitempty"`
+	Names           []string        `json:"names,omitempty"`
+	Mappings        string          `json:"mappings"`
 	decodedMappings []*Mapping
+	fileIndexMap    map[string]int
+	nameIndexMap    map[string]int
+	fullSources     map[int]string
+	resolvedSources map[int]string
 }
 
 type Mapping struct {
-	GeneratedLine   int
-	GeneratedColumn int
-	OriginalFile    string
-	OriginalLine    int
-	OriginalColumn  int
-	OriginalName    string
+	GeneratedLine       int
+	GeneratedColumn     int
+	OriginalSourceIndex int
+	OriginalLine        int
+	OriginalColumn      int
+	OriginalNameIndex   int
+	m                   *Map
+}
+
+type SourceContent []byte
+
+func (s *SourceContent) UnmarshalJSON(d []byte) error {
+	var (
+		str string
+		err = json.Unmarshal(d, &str)
+	)
+	if err == nil {
+		*s = []byte(str)
+	}
+	return err
+}
+
+func (s *SourceContent) MarshalJSON() ([]byte, error) {
+	return json.Marshal(string(*s))
+}
+
+func New() *Map {
+	return &Map{Version: 3}
+}
+
+func (m *Map) IndexForSource(name string) int {
+	if i, ok := m.fileIndexMap[name]; ok {
+		return i
+	}
+	return -1
+}
+
+func (m *Map) IndexForName(name string) int {
+	if i, ok := m.nameIndexMap[name]; ok {
+		return i
+	}
+	return -1
+}
+
+func (m *Map) AddSource(name string, content []byte) int {
+	if name == "" {
+		return -1
+	}
+	if i, ok := m.fileIndexMap[name]; ok {
+		return i
+	}
+	if m.fileIndexMap == nil {
+		m.fileIndexMap = make(map[string]int)
+	}
+	i := len(m.Sources)
+	m.Sources = append(m.Sources, name)
+	m.fileIndexMap[name] = i
+	if content != nil {
+		if len(m.SourcesContent) != len(m.Sources) {
+			l := make([]SourceContent, len(m.Sources))
+			copy(l, m.SourcesContent)
+			m.SourcesContent = l
+		}
+		m.SourcesContent[i] = content
+	}
+	return i
+}
+
+func (m *Map) AddName(name string) int {
+	if name == "" {
+		return -1
+	}
+	if i, ok := m.nameIndexMap[name]; ok {
+		return i
+	}
+	if m.nameIndexMap == nil {
+		m.nameIndexMap = make(map[string]int)
+	}
+	i := len(m.Names)
+	m.Names = append(m.Names, name)
+	m.nameIndexMap[name] = i
+	return i
+}
+
+func (m *Mapping) OriginalSource() string {
+	if m.OriginalSourceIndex < 0 {
+		return ""
+	}
+	return m.m.Sources[m.OriginalSourceIndex]
+}
+
+func (m *Mapping) OriginalFullSource() string {
+	if m.OriginalSourceIndex < 0 {
+		return ""
+	}
+	if m.m.SourceRoot == "" {
+		return m.OriginalSource()
+	}
+	if s, ok := m.m.fullSources[m.OriginalSourceIndex]; ok {
+		return s
+	}
+	if m.m.fullSources == nil {
+		m.m.fullSources = make(map[int]string)
+	}
+	s := path.Join(m.m.SourceRoot, m.OriginalSource())
+	m.m.fullSources[m.OriginalSourceIndex] = s
+	return s
+}
+
+func (m *Mapping) OriginalResolvedSource() string {
+	if m.OriginalSourceIndex < 0 {
+		return ""
+	}
+	if m.m.File == "" {
+		return m.OriginalFullSource()
+	}
+	if s, ok := m.m.resolvedSources[m.OriginalSourceIndex]; ok {
+		return s
+	}
+	if m.m.resolvedSources == nil {
+		m.m.resolvedSources = make(map[int]string)
+	}
+	s := m.OriginalFullSource()
+	if !path.IsAbs(s) {
+		s = path.Clean(path.Join(path.Dir(m.m.File), s))
+	}
+	m.m.resolvedSources[m.OriginalSourceIndex] = s
+	return s
+}
+
+func (m *Mapping) OriginalSourceContent() []byte {
+	if m.OriginalSourceIndex < 0 {
+		return nil
+	}
+	if len(m.m.SourcesContent) > m.OriginalSourceIndex {
+		return m.m.SourcesContent[m.OriginalSourceIndex]
+	}
+	return nil
+}
+
+func (m *Mapping) OriginalName() string {
+	if m.OriginalNameIndex < 0 {
+		return ""
+	}
+	return m.m.Names[m.OriginalNameIndex]
 }
 
 func ReadFrom(r io.Reader) (*Map, error) {
@@ -33,6 +178,17 @@ func ReadFrom(r io.Reader) (*Map, error) {
 	if err := d.Decode(&m); err != nil {
 		return nil, err
 	}
+
+	m.fileIndexMap = make(map[string]int)
+	m.nameIndexMap = make(map[string]int)
+
+	for i, s := range m.Sources {
+		m.fileIndexMap[s] = i
+	}
+	for i, s := range m.Names {
+		m.nameIndexMap[s] = i
+	}
+
 	return &m, nil
 }
 
@@ -84,7 +240,7 @@ func (m *Map) decodeMappings() {
 					r.UnreadByte()
 					return 0
 				}
-				v += (o &^ 32) << s
+				v += o &^ 32 << s
 				if o&32 == 0 {
 					break
 				}
@@ -104,11 +260,11 @@ func (m *Map) decodeMappings() {
 
 		switch count {
 		case 1:
-			m.decodedMappings = append(m.decodedMappings, &Mapping{generatedLine, generatedColumn, "", 0, 0, ""})
+			m.decodedMappings = append(m.decodedMappings, &Mapping{generatedLine, generatedColumn, -1, 0, 0, -1, m})
 		case 4:
-			m.decodedMappings = append(m.decodedMappings, &Mapping{generatedLine, generatedColumn, m.Sources[originalFile], originalLine, originalColumn, ""})
+			m.decodedMappings = append(m.decodedMappings, &Mapping{generatedLine, generatedColumn, originalFile, originalLine, originalColumn, -1, m})
 		case 5:
-			m.decodedMappings = append(m.decodedMappings, &Mapping{generatedLine, generatedColumn, m.Sources[originalFile], originalLine, originalColumn, m.Names[originalName]})
+			m.decodedMappings = append(m.decodedMappings, &Mapping{generatedLine, generatedColumn, originalFile, originalLine, originalColumn, originalName, m})
 		}
 	}
 }
@@ -135,7 +291,7 @@ func (m *Map) Len() int {
 func (m *Map) Less(i, j int) bool {
 	a := m.decodedMappings[i]
 	b := m.decodedMappings[j]
-	return a.GeneratedLine < b.GeneratedLine || (a.GeneratedLine == b.GeneratedLine && a.GeneratedColumn < b.GeneratedColumn)
+	return a.GeneratedLine < b.GeneratedLine || a.GeneratedLine == b.GeneratedLine && a.GeneratedColumn < b.GeneratedColumn
 }
 
 func (m *Map) Swap(i, j int) {
@@ -144,10 +300,6 @@ func (m *Map) Swap(i, j int) {
 
 func (m *Map) EncodeMappings() {
 	sort.Sort(m)
-	m.Sources = nil
-	fileIndexMap := make(map[string]int)
-	m.Names = nil
-	nameIndexMap := make(map[string]int)
 	var generatedLine = 1
 	var generatedColumn = 0
 	var originalFile = 0
@@ -174,7 +326,7 @@ func (m *Map) EncodeMappings() {
 				v |= 1
 			}
 			for v >= 32 {
-				buf.WriteByte(base64encode[32|(v&31)])
+				buf.WriteByte(base64encode[32|v&31])
 				v >>= 5
 			}
 			buf.WriteByte(base64encode[v])
@@ -183,13 +335,8 @@ func (m *Map) EncodeMappings() {
 		writeVLQ(mapping.GeneratedColumn - generatedColumn)
 		generatedColumn = mapping.GeneratedColumn
 
-		if mapping.OriginalFile != "" {
-			fileIndex, ok := fileIndexMap[mapping.OriginalFile]
-			if !ok {
-				fileIndex = len(m.Sources)
-				fileIndexMap[mapping.OriginalFile] = fileIndex
-				m.Sources = append(m.Sources, mapping.OriginalFile)
-			}
+		if mapping.OriginalSourceIndex >= 0 {
+			fileIndex := mapping.OriginalSourceIndex
 			writeVLQ(fileIndex - originalFile)
 			originalFile = fileIndex
 
@@ -199,13 +346,8 @@ func (m *Map) EncodeMappings() {
 			writeVLQ(mapping.OriginalColumn - originalColumn)
 			originalColumn = mapping.OriginalColumn
 
-			if mapping.OriginalName != "" {
-				nameIndex, ok := nameIndexMap[mapping.OriginalName]
-				if !ok {
-					nameIndex = len(m.Names)
-					nameIndexMap[mapping.OriginalName] = nameIndex
-					m.Names = append(m.Names, mapping.OriginalName)
-				}
+			if mapping.OriginalNameIndex >= 0 {
+				nameIndex := mapping.OriginalNameIndex
 				writeVLQ(nameIndex - originalName)
 				originalName = nameIndex
 			}
@@ -225,4 +367,38 @@ func (m *Map) WriteTo(w io.Writer) error {
 	}
 	enc := json.NewEncoder(w)
 	return enc.Encode(m)
+}
+
+func (a *Map) Append(b *Map, line_offset int) {
+	a.decodeMappings()
+	b.decodeMappings()
+
+	out := make([]*Mapping, len(a.decodedMappings)+len(b.decodedMappings))
+	copy(out, a.decodedMappings)
+	copy(out[len(a.decodedMappings):], b.decodedMappings)
+	appended := out[len(a.decodedMappings):]
+
+	a_last_source_index := -1
+	b_last_source_index := -1
+
+	for i, bm := range appended {
+		// copy mapping from b
+		am := &Mapping{}
+		*am = *bm
+		am.m = a
+		appended[i] = am
+
+		// update indexes
+		if b_last_source_index == bm.OriginalSourceIndex {
+			am.OriginalSourceIndex = a_last_source_index
+		} else {
+			b_last_source_index = bm.OriginalSourceIndex
+			a_last_source_index = a.AddSource(bm.OriginalResolvedSource(), bm.OriginalSourceContent())
+			am.OriginalSourceIndex = a_last_source_index
+		}
+		am.OriginalNameIndex = a.AddName(bm.OriginalName())
+		am.GeneratedLine += line_offset
+	}
+
+	a.decodedMappings = out
 }
